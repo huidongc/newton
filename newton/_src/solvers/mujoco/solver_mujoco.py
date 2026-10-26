@@ -6145,32 +6145,46 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             mujoco.mj_implicit(model, data)
 
     def _copy_mjwarp_contacts_to_mj_data(self) -> None:
-        """Copy converted Newton contacts into the native MuJoCo contact buffer.
+        """Copy active Newton contacts into the native MuJoCo contact buffer.
 
-        Newton can report a contact that is still separated. MuJoCo collision and
-        MJWarp activate a contact only when ``dist < includemargin``;
-        ``mj_makeConstraint`` does not repeat that test. Excluding the separated
-        rows keeps them available for contact-force matching without letting them
-        push.
+        MJWarp makes a constraint only when ``dist < includemargin``. A separated
+        row left in this buffer with ``exclude`` set crashes ``mj_fwdConstraint``
+        once another constraint, such as a joint limit, is active. Omit those
+        rows. Newton rows that no longer have a MuJoCo contact keep a zero force.
         """
         data = self.mj_data
         contact = self.mjw_data.contact
         count = int(self.mjw_data.nacon.numpy()[0])
-        data.ncon = count
         if count == 0:
+            data.ncon = 0
             return
-        dist = contact.dist.numpy()
+        dist = np.asarray(contact.dist.numpy()[:count])
+        margin = np.asarray(contact.includemargin.numpy()[:count])
+        dim = np.asarray(contact.dim.numpy()[:count])
+        geom = np.asarray(contact.geom.numpy()[:count])
+        ngeom = int(self.mj_model.ngeom)
+        active = (
+            np.isfinite(dist)
+            & np.isfinite(margin)
+            & (dist < margin)
+            & np.isin(dim, (1, 3, 4, 6))
+            & (geom[:, 0] >= 0)
+            & (geom[:, 1] >= 0)
+            & (geom[:, 0] < ngeom)
+            & (geom[:, 1] < ngeom)
+        )
+        chosen = np.flatnonzero(active)
+        data.ncon = int(chosen.size)
+        if chosen.size == 0:
+            return
         pos = contact.pos.numpy()
         frame = contact.frame.numpy()
-        margin = contact.includemargin.numpy()
         friction = contact.friction.numpy()
         solref = contact.solref.numpy()
         solreffriction = contact.solreffriction.numpy()
         solimp = contact.solimp.numpy()
-        dim = contact.dim.numpy()
-        geom = contact.geom.numpy()
-        for index in range(count):
-            slot = data.contact[index]
+        for slot_index, index in enumerate(chosen):
+            slot = data.contact[int(slot_index)]
             slot.dist = float(dist[index])
             slot.pos[:] = pos[index]
             slot.frame[:] = np.asarray(frame[index], dtype=np.float64).reshape(9)
@@ -6180,10 +6194,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             slot.solreffriction[:] = solreffriction[index]
             slot.solimp[:] = solimp[index]
             slot.dim = int(dim[index])
-            slot.geom[:] = geom[index]
+            geom_id = (int(geom[index, 0]), int(geom[index, 1]))
+            slot.geom[:] = geom_id
+            slot.geom1 = geom_id[0]
+            slot.geom2 = geom_id[1]
             slot.mu = float(friction[index, 0])
-            # Match MJWarp: a row with dist >= includemargin is not a constraint.
-            slot.exclude = int(float(dist[index]) >= float(margin[index]))
+            slot.exclude = 0
             slot.efc_address = -1
             slot.adhesion = 0.0
             slot.flex[:] = -1
@@ -6598,8 +6614,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         ``mujoco_warp`` ``contact_force_fn``. Each stored row is that wrench
         rotated into the world and expressed on the Newton row's shape0. Rows
         with no matching MuJoCo contact stay zero. When
-        ``use_mujoco_contacts=False``, the MuJoCo contacts are the Newton rows
-        injected for this step.
+        ``use_mujoco_contacts=False``, the MuJoCo contacts are the active Newton
+        rows injected for this step. Separated rows are omitted and stay zero.
         """
         from scipy.optimize import linear_sum_assignment
 
