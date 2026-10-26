@@ -5726,6 +5726,193 @@ class TestMuJoCoContactForce(unittest.TestCase):
         expected_fz = -self.BOX_MASS * self.GRAVITY if shape0 == ramp_shape else self.BOX_MASS * self.GRAVITY
         np.testing.assert_allclose(force[2], expected_fz, rtol=0.05)
 
+    def test_native_cpu_contact_force_on_newton_rows(self):
+        """Publish CPU contact wrenches on Newton rows, not in MuJoCo contact order."""
+        mass = 1.0
+        half = 0.15
+        gravity = 9.81
+        moment = (1.0 / 3.0) * mass * (half * half + half * half)
+        inertia = wp.mat33([[moment, 0.0, 0.0], [0.0, moment, 0.0], [0.0, 0.0, moment]])
+
+        builder = newton.ModelBuilder()
+        builder.gravity = wp.vec3(0.0, 0.0, -gravity)
+        ground = builder.add_ground_plane()
+        builder.begin_world(label="box")
+        body = builder.add_body(
+            label="box",
+            mass=mass,
+            inertia=inertia,
+            xform=wp.transform(wp.vec3(0.0, 0.0, half), wp.quat_identity()),
+            lock_inertia=True,
+        )
+        builder.add_shape_box(
+            body,
+            hx=half,
+            hy=half,
+            hz=half,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.0),
+            label="box",
+        )
+        builder.end_world()
+        model = builder.finalize()
+        self.assertAlmostEqual(float(model.body_mass.numpy()[body]), mass)
+
+        solver = SolverMuJoCo(model, use_mujoco_cpu=True, use_mujoco_contacts=False, enable_sleeping=False)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        observables = solver.observables(
+            {newton.solvers.SolverBase.ObservableKind.CONTACT_F},
+            contacts=contacts,
+        )
+        self.assertIsNotNone(observables.contact_f)
+
+        state_in, state_out = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+        control = model.control()
+        dt = 1.0 / 60.0
+        geometry_fields = (
+            "rigid_contact_count",
+            "rigid_contact_shape0",
+            "rigid_contact_shape1",
+            "rigid_contact_point0",
+            "rigid_contact_point1",
+            "rigid_contact_normal",
+            "rigid_contact_offset0",
+            "rigid_contact_offset1",
+            "rigid_contact_margin0",
+            "rigid_contact_margin1",
+            "contact_generation",
+        )
+
+        def step_once() -> None:
+            nonlocal state_in, state_out
+            state_in.clear_forces()
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, control, contacts, dt, observables=observables)
+            state_in, state_out = state_out, state_in
+
+        for _ in range(179):
+            step_once()
+
+        state_in.clear_forces()
+        pipeline.collide(state_in, contacts)
+        snapshots = {field: getattr(contacts, field).numpy().copy() for field in geometry_fields}
+        solver.step(state_in, state_out, control, contacts, dt, observables=observables)
+        for field, expected in snapshots.items():
+            np.testing.assert_array_equal(getattr(contacts, field).numpy(), expected, err_msg=field)
+
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertEqual(count, 4)
+        shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+        shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+        linear = observables.contact_f.numpy()[:count, :3]
+        self.assertTrue(np.all(shape0 == ground))
+        np.testing.assert_allclose(linear[:, 2], -mass * gravity / count, atol=0.1)
+        np.testing.assert_allclose(linear[:, :2], 0.0, atol=0.05)
+        np.testing.assert_allclose(observables.contact_f.numpy()[count:], 0.0, atol=0.0)
+
+        shape_body = model.shape_body.numpy()
+        net = np.zeros(3, dtype=np.float64)
+        for index in range(count):
+            force = linear[index]
+            if int(shape_body[int(shape0[index])]) == body:
+                net += force
+            if int(shape_body[int(shape1[index])]) == body:
+                net -= force
+        np.testing.assert_allclose(net, [0.0, 0.0, mass * gravity], atol=0.05)
+
+        state_in, state_out = state_out, state_in
+        state_in.clear_forces()
+        culled = contacts.rigid_contact_shape0.numpy().copy()
+        culled[0] = -1
+        contacts.rigid_contact_shape0.assign(culled)
+        culled_snapshots = {field: getattr(contacts, field).numpy().copy() for field in geometry_fields}
+        solver.step(state_in, state_out, control, contacts, dt, observables=observables)
+        for field, expected in culled_snapshots.items():
+            np.testing.assert_array_equal(getattr(contacts, field).numpy(), expected, err_msg=field)
+        culled_force = observables.contact_f.numpy()
+        np.testing.assert_allclose(culled_force[0], 0.0, atol=0.0)
+        np.testing.assert_allclose(culled_force[1:count, 2].sum(), -0.75 * mass * gravity, atol=0.2)
+        self.assertGreater(np.linalg.norm(culled_force[1:count, :3]), 1.0)
+
+    def test_native_cpu_planar_mesh_uses_newton_contacts(self):
+        """A planar ground mesh must be solved from Newton contacts, not the thickened MuJoCo mesh."""
+        mass = 1.0
+        half = 0.15
+        gravity = 9.81
+        moment = (1.0 / 3.0) * mass * (half * half + half * half)
+        inertia = wp.mat33([[moment, 0.0, 0.0], [0.0, moment, 0.0], [0.0, 0.0, moment]])
+        extent = 10.0
+        vertices = np.array(
+            [
+                [-extent, -extent, 0.0],
+                [extent, -extent, 0.0],
+                [-extent, extent, 0.0],
+                [extent, extent, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        indices = np.array([0, 1, 2, 1, 3, 2], dtype=np.int32)
+
+        builder = newton.ModelBuilder()
+        builder.gravity = wp.vec3(0.0, 0.0, -gravity)
+        mesh = newton.Mesh(vertices=vertices, indices=indices, compute_inertia=False)
+        ground = builder.add_shape_mesh(body=-1, mesh=mesh, label="ground")
+        builder.begin_world(label="box")
+        body = builder.add_body(
+            label="box",
+            mass=mass,
+            inertia=inertia,
+            xform=wp.transform(wp.vec3(0.0, 0.0, half), wp.quat_identity()),
+            lock_inertia=True,
+        )
+        builder.add_shape_box(
+            body,
+            hx=half,
+            hy=half,
+            hz=half,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.0),
+            label="box",
+        )
+        builder.end_world()
+        model = builder.finalize()
+
+        solver = SolverMuJoCo(model, use_mujoco_cpu=True, use_mujoco_contacts=False, enable_sleeping=False)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        observables = solver.observables(
+            {
+                newton.solvers.SolverBase.ObservableKind.CONTACT_F,
+                newton.solvers.SolverBase.ObservableKind.BODY_QDD,
+            },
+            contacts=contacts,
+        )
+        state_in, state_out = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+        control = model.control()
+        dt = 1.0 / 60.0
+        for _ in range(120):
+            state_in.clear_forces()
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, control, contacts, dt, observables=observables)
+            state_in, state_out = state_out, state_in
+
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(count, 0)
+        shape0 = contacts.rigid_contact_shape0.numpy()
+        shape1 = contacts.rigid_contact_shape1.numpy()
+        linear = observables.contact_f.numpy()[:, :3]
+        shape_body = model.shape_body.numpy()
+        net = np.zeros(3, dtype=np.float64)
+        for index in range(count):
+            force = linear[index]
+            if int(shape_body[int(shape0[index])]) == body:
+                net += force
+            if int(shape_body[int(shape1[index])]) == body:
+                net -= force
+        np.testing.assert_allclose(net, [0.0, 0.0, mass * gravity], atol=0.05)
+        self.assertTrue(ground in {int(shape0[index]) for index in range(count)} | {int(shape1[index]) for index in range(count)})
+
 
 class TestMuJoCoValidation(unittest.TestCase):
     """Test cases for SolverMuJoCo._validate_model_for_separate_worlds()."""
@@ -7833,19 +8020,21 @@ class TestMuJoCoOptions(unittest.TestCase):
         """Validate native observable support for each integrator family."""
         model = self._create_multiworld_model(world_count=1)
         solver = SolverMuJoCo(model, use_mujoco_cpu=True)
-        for kind in (solver.ObservableKind.BODY_QDD, solver.ObservableKind.BODY_PARENT_F):
-            self.assertIn(kind, solver.supported_observables)
-        for flag in (
+        for kind in (
+            solver.ObservableKind.BODY_QDD,
+            solver.ObservableKind.BODY_PARENT_F,
             solver.ObservableKind.CONTACT_F,
-            solver.ObservableKind.OVERFLOW,
         ):
-            with self.subTest(flag=flag):
-                self.assertNotIn(flag, solver.supported_observables)
-                with self.assertRaisesRegex(ValueError, "does not support"):
-                    solver.observables(kinds={flag})
+            self.assertIn(kind, solver.supported_observables)
+        overflow = solver.ObservableKind.OVERFLOW
+        self.assertNotIn(overflow, solver.supported_observables)
+        with self.assertRaisesRegex(ValueError, "does not support"):
+            solver.observables(kinds={overflow})
         flag = SolverMuJoCo.ObservableKind.QFRC_ACTUATOR
-        observables = solver.observables(solver.supported_observables)
-        self.assertEqual(observables.kinds, {flag, solver.ObservableKind.BODY_QDD, solver.ObservableKind.BODY_PARENT_F})
+        # CONTACT_F is supported, but allocating it requires a Contacts buffer.
+        body_kinds = {flag, solver.ObservableKind.BODY_QDD, solver.ObservableKind.BODY_PARENT_F}
+        observables = solver.observables(body_kinds)
+        self.assertEqual(observables.kinds, body_kinds)
         self.assertIsNotNone(observables.body_qdd)
         self.assertIsNotNone(observables.body_parent_f)
         self.assertIsNone(observables.contact_f)
@@ -7855,14 +8044,14 @@ class TestMuJoCoOptions(unittest.TestCase):
         np.testing.assert_allclose(observables.qfrc_actuator.numpy(), solver.mj_data.qfrc_actuator, atol=1e-6)
 
         # Discrete stepping works, but its native integrator has no Python binding
-        # for inserting body exports before integration.
+        # for inserting body exports before integration. CONTACT_F does not use that hook.
         solver = SolverMuJoCo(model, use_mujoco_cpu=True, integrator=int(solver._mujoco.mjtIntegrator.mjINT_DISCRETE))
-        self.assertEqual(solver.supported_observables, {flag})
+        self.assertEqual(solver.supported_observables, {flag, solver.ObservableKind.CONTACT_F})
         for kind in (solver.ObservableKind.BODY_QDD, solver.ObservableKind.BODY_PARENT_F):
             with self.subTest(integrator="discrete", kind=kind):
                 with self.assertRaisesRegex(ValueError, "does not support"):
                     solver.observables({kind})
-        observables = solver.observables(solver.supported_observables)
+        observables = solver.observables({flag})
         state_out = model.state()
         control = model.control()
         control.joint_f.fill_(1.0)

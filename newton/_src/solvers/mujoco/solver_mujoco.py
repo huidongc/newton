@@ -536,6 +536,26 @@ _MJW_BATCHED_MODEL_FIELDS = (
 )
 
 
+def _body_pose_components(body_q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return world positions and xyzw quaternions from a Warp transform buffer."""
+    if body_q.dtype.names and "p" in body_q.dtype.names:
+        return np.asarray(body_q["p"], dtype=np.float64), np.asarray(body_q["q"], dtype=np.float64)
+    flat = np.ascontiguousarray(body_q, dtype=np.float64).reshape(body_q.shape[0], 7)
+    return flat[:, :3], flat[:, 3:]
+
+
+def _rotate_xyzw(quat: np.ndarray, point: np.ndarray) -> np.ndarray:
+    """Rotate ``point`` by a unit quaternion stored as xyzw."""
+    xyz = quat[:3]
+    tangent = 2.0 * np.cross(xyz, point)
+    return point + float(quat[3]) * tangent + np.cross(xyz, tangent)
+
+
+def _shape_pair_key(shape_a: int, shape_b: int) -> tuple[int, int]:
+    """Order a shape pair so geom order does not change the match group."""
+    return (shape_a, shape_b) if shape_a <= shape_b else (shape_b, shape_a)
+
+
 class SolverMuJoCo(SolverBase, CouplingInterface):
     """
     This solver provides an interface to simulate physics using the `MuJoCo <https://github.com/google-deepmind/mujoco>`_ physics engine,
@@ -627,12 +647,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         The native CPU backend (``use_mujoco_cpu=True``) supports
         ``BODY_QDD`` and ``BODY_PARENT_F`` with Euler, RK4, implicit, or
-        implicitfast integration, and ``QFRC_ACTUATOR`` with any integrator. MuJoCo Warp
-        also supports the standard contact fields, including body fields when
-        sensors are disabled. With native collision detection, contact storage must cover
-        :meth:`SolverMuJoCo.get_max_contact_count`. External collision detection
-        uses the pipeline's own capacity. Construct a compatible
-        :class:`~newton.CollisionPipeline` before allocating contact observables.
+        implicitfast integration, ``QFRC_ACTUATOR`` with any integrator, and
+        ``CONTACT_F`` on the Newton contact rows passed to ``step``. Overflow
+        remains available only on MuJoCo Warp. MuJoCo Warp also reports body
+        fields when sensors are disabled. With native collision detection,
+        contact storage must cover :meth:`SolverMuJoCo.get_max_contact_count`.
+        External collision detection uses the pipeline's own capacity. Construct
+        a compatible :class:`~newton.CollisionPipeline` before allocating
+        contact observables.
 
         See :ref:`solver_observables` for allocation and native collision examples.
 
@@ -687,13 +709,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """
         kinds = super().supported_observables
         if self.use_mujoco_cpu:
-            # Contact forces and overflow flags are only exported from MuJoCo Warp data.
-            kinds = kinds.difference(
-                {
-                    SolverBase.ObservableKind.CONTACT_F,
-                    self.ObservableKind.OVERFLOW,
-                }
-            )
+            # Overflow flags are only exported from MuJoCo Warp data.
+            kinds = kinds.difference({self.ObservableKind.OVERFLOW})
             if self.mj_model.opt.integrator not in (
                 self._mujoco.mjtIntegrator.mjINT_EULER,
                 self._mujoco.mjtIntegrator.mjINT_RK4,
@@ -4332,7 +4349,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             disable_sensors: If True, disable sensor computation in MuJoCo. If False, enable it. If None, use the model custom attribute or enable it by default. ``body_qdd`` and ``body_parent_f`` are still computed on either backend when requested through solver observables or legacy output-state fields.
             update_data_interval: Frequency (in simulation steps) at which to update the MuJoCo Data object from the Newton state. If 0, Data is never updated after initialization.
             save_to_mjcf: Optional path to save the generated MJCF model file.
-            use_mujoco_contacts: If True, use the MuJoCo contact solver. If False, use the Newton contact solver (newton contacts must be passed in through the step function in that case).
+            use_mujoco_contacts: If True, MuJoCo runs its own collision detection. If False, Newton contacts passed to :meth:`step` are solved instead. The CPU backend accepts those contacts with Euler, implicit, or implicitfast.
             use_speculative_contacts: Add frictionless normal constraints for separated Newton
                 contact candidates, bounding closing velocity by clearance divided by the physics timestep.
                 Requires ``use_mujoco_contacts=False``, the MuJoCo Warp backend, and Euler or implicitfast
@@ -4612,7 +4629,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._canonical_bvh_aabb: np.ndarray | None = None
         self._canonical_body_ipos: np.ndarray | None = None
         self._canonical_body_iquat: np.ndarray | None = None
-        if use_mujoco_contacts or use_mujoco_cpu:
+        if use_mujoco_contacts:
             mujoco_attrs_for_warn = getattr(model, "mujoco", None)
             solref_mode_attr = (
                 getattr(mujoco_attrs_for_warn, "solref_mode", None) if mujoco_attrs_for_warn is not None else None
@@ -4620,21 +4637,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             if solref_mode_attr is not None:
                 force_space_shapes = int(np.count_nonzero(solref_mode_attr.numpy() == SOLREF_MODE_FORCE_SPACE))
                 if force_space_shapes > 0:
-                    backends = [
-                        name
-                        for name, flag in (
-                            ("use_mujoco_contacts=True", use_mujoco_contacts),
-                            ("use_mujoco_cpu=True", use_mujoco_cpu),
-                        )
-                        if flag
-                    ]
                     warnings.warn(
                         f"{force_space_shapes} shape(s) have mujoco.solref_mode == SOLREF_MODE_FORCE_SPACE "
-                        f"but SolverMuJoCo is running with {', '.join(backends)}. The per-contact "
-                        "body_invweight0 override only fires on the Newton-contacts GPU path "
-                        "(use_mujoco_contacts=False); on this backend these shapes silently fall back to "
-                        "the legacy convert_solref(ke, kd, 1, 1) approximation and shape_material_ke/kd "
-                        "will not behave as force-space gains. See "
+                        "but SolverMuJoCo is running with use_mujoco_contacts=True. The per-contact "
+                        "body_invweight0 override only fires when use_mujoco_contacts=False; on this "
+                        "backend these shapes silently fall back to the legacy convert_solref(ke, kd, 1, 1) "
+                        "approximation and shape_material_ke/kd will not behave as force-space gains. See "
                         "docs/solvers/mujoco.rst > 'Shape-material contact stiffness and damping'.",
                         NewtonWarning,
                         stacklevel=2,
@@ -4738,9 +4746,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 include_sites=include_sites,
                 skip_visual_only_geoms=skip_visual_only_geoms,
             )
-        if not use_mujoco_cpu and not use_mujoco_contacts:
+        if not use_mujoco_contacts:
             # Persistent mappings must be initialized outside step(), which may
             # first run inside a CUDA graph that is discarded without replay.
+            # The CPU backend uses the same mapping to copy Newton contacts
+            # into ``mj_data`` before the native constraint solve.
             self._create_inverse_shape_mapping()
             self._contact_tid_to_cid = wp.full(self.mjw_data.naconmax, -1, dtype=wp.int32, device=self.device)
         self._initial_model_sync = False
@@ -4858,7 +4868,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         1. **Push** — transfer ``state_in`` and ``control`` to MuJoCo's working
            data.  When ``use_mujoco_contacts=False``, ``contacts`` are also
-           converted and fed to MuJoCo Warp before the integrator runs.
+           converted and passed to MuJoCo before the integrator runs.
         2. **Integrate** — run MuJoCo (CPU) or MuJoCo Warp (GPU) forward by
            ``dt`` seconds.
         3. **Pull** — populate ``state_out`` from the integrated MuJoCo data.
@@ -4899,7 +4909,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             control: Joint targets and feedforward forces.
             contacts: Newton collision pipeline contacts.  Required when
                 ``use_mujoco_contacts=False``.  Ignored (and may be ``None``)
-                when ``use_mujoco_contacts=True`` (MuJoCo Warp runs its own
+                when ``use_mujoco_contacts=True`` (MuJoCo runs its own
                 collision detection); the Newton bits of
                 ``Observables.overflow`` are suppressed in that mode since
                 the contacts object is not used by the solver.
@@ -4916,22 +4926,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 # XXX updating the mujoco state at every step may introduce numerical instability
                 self._update_mjc_data(self.mj_data, self.model, state_in)
             self.mj_model.opt.timestep = dt
-            needs_body_observables = (
-                state_out.body_qdd is not None
-                or state_out.body_parent_f is not None
-                or (
-                    observables is not None
-                    and (
-                        observables.is_requested(SolverBase.ObservableKind.BODY_QDD)
-                        or observables.is_requested(SolverBase.ObservableKind.BODY_PARENT_F)
-                    )
-                )
-            )
-            if needs_body_observables:
-                self._step_mujoco_cpu_with_body_observables(state_out, observables)
-            else:
-                self._mujoco.mj_step(self.mj_model, self.mj_data)
+            self._advance_mujoco_cpu(state_in, state_out, contacts, observables)
             self._update_newton_state(self.model, state_out, self.mj_data, state_prev=state_in, observables=observables)
+            if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F):
+                if contacts is None or observables.contact_f is None:
+                    raise ValueError("Contact storage is missing from solver observables.")
+                self._populate_cpu_contact_forces(state_in, contacts, observables.contact_f)
         else:
             with wp.ScopedDevice(self.model.device), self._scoped_mujoco_warp_execution():
                 self._enable_rne_postconstraint(state_out, observables)
@@ -6056,6 +6056,140 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             mj_data.qpos[:] = qpos.numpy().flatten()[: len(mj_data.qpos)]
             mj_data.qvel[:] = qvel.numpy().flatten()[: len(mj_data.qvel)]
 
+    def _needs_cpu_body_observables(self, state_out: State, observables: SolverBase.Observables | None) -> bool:
+        """Return whether this step must export body diagnostics before integration."""
+        return state_out.body_qdd is not None or state_out.body_parent_f is not None or (
+            observables is not None
+            and (
+                observables.is_requested(SolverBase.ObservableKind.BODY_QDD)
+                or observables.is_requested(SolverBase.ObservableKind.BODY_PARENT_F)
+            )
+        )
+
+    def _advance_mujoco_cpu(
+        self,
+        state_in: State,
+        state_out: State,
+        contacts: Contacts | None,
+        observables: SolverBase.Observables | None,
+    ) -> None:
+        """Integrate native MuJoCo, using Newton contacts when requested."""
+        if self._use_mujoco_contacts:
+            if self._needs_cpu_body_observables(state_out, observables):
+                self._step_mujoco_cpu_with_body_observables(state_out, observables)
+            else:
+                self._mujoco.mj_step(self.mj_model, self.mj_data)
+            return
+        if contacts is None:
+            raise ValueError(
+                "contacts is required when use_mujoco_contacts=False "
+                "(the MuJoCo CPU backend does not run its own collision detection)."
+            )
+        self._step_mujoco_cpu_with_newton_contacts(state_in, state_out, contacts, observables)
+
+    def _step_mujoco_cpu_with_newton_contacts(
+        self,
+        state_in: State,
+        state_out: State,
+        contacts: Contacts,
+        observables: SolverBase.Observables | None,
+    ) -> None:
+        """Solve the supplied Newton contacts, then integrate.
+
+        ``mj_fwdPosition`` is MuJoCo's collision stage. Suppress it so a planar
+        mesh that had to be thickened for MuJoCo compilation is not what the
+        constraint solver sees. Euler, implicit, and implicitfast then integrate
+        the injected acceleration. RK4 and the discrete integrator re-run
+        collision internally and would drop those contacts.
+        """
+        mujoco, model, data = self._mujoco, self.mj_model, self.mj_data
+        integrator = model.opt.integrator
+        if integrator not in (
+            mujoco.mjtIntegrator.mjINT_EULER,
+            mujoco.mjtIntegrator.mjINT_IMPLICIT,
+            mujoco.mjtIntegrator.mjINT_IMPLICITFAST,
+        ):
+            raise ValueError(
+                "Passing Newton contacts to the MuJoCo CPU backend requires Euler, implicit, or implicitfast. "
+                "RK4 and the discrete integrator re-run collision and would ignore those contacts."
+            )
+
+        mujoco.mj_checkPos(model, data)
+        mujoco.mj_checkVel(model, data)
+        contact_bit = int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+        suppress_collision = not bool(model.opt.disableflags & contact_bit)
+        if suppress_collision:
+            model.opt.disableflags |= contact_bit
+        try:
+            mujoco.mj_fwdPosition(model, data)
+        finally:
+            if suppress_collision:
+                model.opt.disableflags &= ~contact_bit
+
+        self._convert_contacts_to_mjwarp(self.model, state_in, contacts)
+        self._copy_mjwarp_contacts_to_mj_data()
+        mujoco.mj_makeConstraint(model, data)
+        mujoco.mj_fwdVelocity(model, data)
+        mujoco.mj_fwdActuation(model, data)
+        mujoco.mj_fwdAcceleration(model, data)
+        mujoco.mj_fwdConstraint(model, data)
+        mujoco.mj_checkAcc(model, data)
+        if model.opt.enableflags & mujoco.mjtEnableBit.mjENBL_FWDINV:
+            mujoco.mj_compareFwdInv(model, data)
+        if self._needs_cpu_body_observables(state_out, observables):
+            self._update_body_observables(self.model, state_out, data, observables)
+
+        if integrator == mujoco.mjtIntegrator.mjINT_EULER:
+            mujoco.mj_Euler(model, data)
+        else:
+            mujoco.mj_implicit(model, data)
+
+    def _copy_mjwarp_contacts_to_mj_data(self) -> None:
+        """Copy converted Newton contacts into the native MuJoCo contact buffer.
+
+        Newton can report a contact that is still separated. MuJoCo collision and
+        MJWarp activate a contact only when ``dist < includemargin``;
+        ``mj_makeConstraint`` does not repeat that test. Excluding the separated
+        rows keeps them available for contact-force matching without letting them
+        push.
+        """
+        data = self.mj_data
+        contact = self.mjw_data.contact
+        count = int(self.mjw_data.nacon.numpy()[0])
+        data.ncon = count
+        if count == 0:
+            return
+        dist = contact.dist.numpy()
+        pos = contact.pos.numpy()
+        frame = contact.frame.numpy()
+        margin = contact.includemargin.numpy()
+        friction = contact.friction.numpy()
+        solref = contact.solref.numpy()
+        solreffriction = contact.solreffriction.numpy()
+        solimp = contact.solimp.numpy()
+        dim = contact.dim.numpy()
+        geom = contact.geom.numpy()
+        for index in range(count):
+            slot = data.contact[index]
+            slot.dist = float(dist[index])
+            slot.pos[:] = pos[index]
+            slot.frame[:] = np.asarray(frame[index], dtype=np.float64).reshape(9)
+            slot.includemargin = float(margin[index])
+            slot.friction[:] = friction[index]
+            slot.solref[:] = solref[index]
+            slot.solreffriction[:] = solreffriction[index]
+            slot.solimp[:] = solimp[index]
+            slot.dim = int(dim[index])
+            slot.geom[:] = geom[index]
+            slot.mu = float(friction[index, 0])
+            # Match MJWarp: a row with dist >= includemargin is not a constraint.
+            slot.exclude = int(float(dist[index]) >= float(margin[index]))
+            slot.efc_address = -1
+            slot.adhesion = 0.0
+            slot.flex[:] = -1
+            slot.elem[:] = -1
+            slot.vert[:] = -1
+
     def _step_mujoco_cpu_with_body_observables(self, state_out: State, observables: SolverBase.Observables | None):
         """Export native body diagnostics from the forward solve before integration."""
         mujoco, model, data = self._mujoco, self.mj_model, self.mj_data
@@ -6451,6 +6585,109 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 stacklevel=2,
             )
         self._populate_contact_observables(contacts, contacts.force)
+
+    def _populate_cpu_contact_forces(
+        self,
+        state_in: State,
+        contacts: Contacts,
+        contact_f: wp.array,
+    ) -> None:
+        """Map native MuJoCo contact wrenches onto unchanged Newton contact rows.
+
+        ``mj_contactForce`` is the contact-frame wrench on geom2, matching
+        ``mujoco_warp`` ``contact_force_fn``. Each stored row is that wrench
+        rotated into the world and expressed on the Newton row's shape0. Rows
+        with no matching MuJoCo contact stay zero. When
+        ``use_mujoco_contacts=False``, the MuJoCo contacts are the Newton rows
+        injected for this step.
+        """
+        from scipy.optimize import linear_sum_assignment
+
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        written = np.zeros((contact_f.shape[0], 6), dtype=np.float32)
+        ncon = int(self.mj_data.ncon)
+        if count > 0 and ncon > 0 and self.mjc_geom_to_newton_shape is not None:
+            shape_of_geom = self.mjc_geom_to_newton_shape.numpy()[0]
+            shape_body = self.model.shape_body.numpy()
+            shape0 = contacts.rigid_contact_shape0.numpy()
+            shape1 = contacts.rigid_contact_shape1.numpy()
+            point0 = contacts.rigid_contact_point0.numpy()
+            point1 = contacts.rigid_contact_point1.numpy()
+            positions, rotations = _body_pose_components(state_in.body_q.numpy())
+
+            def world_point(shape: int, point: np.ndarray) -> np.ndarray:
+                body = int(shape_body[shape])
+                local = np.asarray(point, dtype=np.float64)
+                if body < 0:
+                    return local
+                return _rotate_xyzw(rotations[body], local) + positions[body]
+
+            newton_pos = np.zeros((count, 3), dtype=np.float64)
+            newton_groups: dict[tuple[int, int], list[int]] = {}
+            for index in range(count):
+                first = int(shape0[index])
+                second = int(shape1[index])
+                if first < 0 or second < 0:
+                    continue
+                newton_pos[index] = 0.5 * (world_point(first, point0[index]) + world_point(second, point1[index]))
+                newton_groups.setdefault(_shape_pair_key(first, second), []).append(index)
+
+            mj_shape0: list[int] = []
+            mj_shape1: list[int] = []
+            mj_pos: list[np.ndarray] = []
+            mj_wrench_on_geom2: list[np.ndarray] = []
+            ngeom = int(shape_of_geom.shape[0])
+            for index in range(ncon):
+                contact = self.mj_data.contact[index]
+                geom0 = int(contact.geom[0])
+                geom1 = int(contact.geom[1])
+                if geom0 < 0 or geom1 < 0 or geom0 >= ngeom or geom1 >= ngeom:
+                    continue
+                first = int(shape_of_geom[geom0])
+                second = int(shape_of_geom[geom1])
+                if first < 0 or second < 0:
+                    continue
+                local = np.zeros(6, dtype=np.float64)
+                self._mujoco.mj_contactForce(self.mj_model, self.mj_data, index, local)
+                frame = np.asarray(contact.frame, dtype=np.float64).reshape(3, 3)
+                # Rows of ``frame`` are the contact axes. ``frame.T @ v`` matches
+                # ``spatial_top @ frame`` in ``contact_force_fn(..., to_world_frame=True)``.
+                world = np.concatenate((frame.T @ local[:3], frame.T @ local[3:]))
+                mj_shape0.append(first)
+                mj_shape1.append(second)
+                mj_pos.append(np.asarray(contact.pos, dtype=np.float64))
+                mj_wrench_on_geom2.append(world)
+
+            mj_groups: dict[tuple[int, int], list[int]] = {}
+            for index, (first, second) in enumerate(zip(mj_shape0, mj_shape1, strict=True)):
+                mj_groups.setdefault(_shape_pair_key(first, second), []).append(index)
+
+            for key, newton_ids in newton_groups.items():
+                mj_ids = mj_groups.get(key)
+                if not mj_ids:
+                    continue
+                cost = np.empty((len(newton_ids), len(mj_ids)), dtype=np.float64)
+                for row, newton_index in enumerate(newton_ids):
+                    for column, mj_index in enumerate(mj_ids):
+                        delta = newton_pos[newton_index] - mj_pos[mj_index]
+                        cost[row, column] = float(delta @ delta)
+                assigned_rows, assigned_cols = linear_sum_assignment(cost)
+                for row, column in zip(assigned_rows, assigned_cols, strict=True):
+                    newton_index = newton_ids[int(row)]
+                    mj_index = mj_ids[int(column)]
+                    wrench = mj_wrench_on_geom2[mj_index]
+                    newton_shape0 = int(shape0[newton_index])
+                    if newton_shape0 == mj_shape0[mj_index]:
+                        # shape0 is geom1. ``mj_contactForce`` acts on geom2.
+                        wrench = -wrench
+                    elif newton_shape0 != mj_shape1[mj_index]:
+                        continue
+                    written[newton_index] = wrench
+
+        contact_f.assign(written)
+        legacy_force = contacts.force
+        if legacy_force is not None and legacy_force.ptr != contact_f.ptr:
+            wp.copy(legacy_force, contact_f, count=legacy_force.shape[0])
 
     def _populate_contact_observables(
         self,

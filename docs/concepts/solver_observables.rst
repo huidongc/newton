@@ -134,7 +134,7 @@ Standard observables
        :class:`~newton.solvers.SolverXPBD`
    * - ``CONTACT_F`` / ``observables.contact_f``
      - Contact spatial forces in the row layout of the step's contacts
-     - :class:`~newton.solvers.SolverMuJoCo` with MuJoCo Warp,
+     - :class:`~newton.solvers.SolverMuJoCo` with MuJoCo Warp or native MuJoCo CPU,
        :class:`~newton.solvers.SolverXPBD`, :class:`~newton.solvers.SolverVBD`,
        :class:`~newton.solvers.SolverKamino`, and :class:`~newton.solvers.SolverSteel`
 
@@ -144,13 +144,21 @@ the velocity impulse divided by ``dt``. MuJoCo Warp computes ``BODY_QDD`` and
 ``BODY_PARENT_F`` even with ``disable_sensors=True`` by enabling the
 post-constraint RNE stage independently of sensors.
 The native MuJoCo CPU backend (``use_mujoco_cpu=True``) supports ``BODY_QDD``,
-``BODY_PARENT_F``, and ``SolverMuJoCo.ObservableKind.QFRC_ACTUATOR``. It runs
-the post-constraint RNE stage for requested body observables before integration,
-using the step's input dynamics, including with RK4. Contact and overflow
-observable requests are rejected. Native body observables require Euler, RK4,
-implicit, or implicitfast integration; discrete integration supports only
-``QFRC_ACTUATOR``. MuJoCo Warp supports body
-observables on both CPU and GPU.
+``BODY_PARENT_F``, ``CONTACT_F``, and ``SolverMuJoCo.ObservableKind.QFRC_ACTUATOR``.
+It runs the post-constraint RNE stage for requested body observables before
+integration, using the step's input dynamics, including with RK4. Overflow
+requests are still rejected. ``CONTACT_F`` is indexed by the Newton contact rows
+passed to ``step``. Each row is the world-frame wrench on shape0, the same sign
+MuJoCo Warp uses when ``use_mujoco_contacts=False``. With
+``use_mujoco_contacts=False``, the CPU step solves those Newton contacts
+(Euler, implicit, or implicitfast) instead of running MuJoCo collision.
+With ``use_mujoco_contacts=True``, MuJoCo collides and the solved contacts are
+associated with the Newton rows by shape pair and position; unmatched rows stay
+zero. Native body observables require Euler, RK4, implicit, or implicitfast
+integration. Passing Newton contacts to the CPU backend requires Euler, implicit,
+or implicitfast. Discrete integration supports ``QFRC_ACTUATOR`` and, when MuJoCo
+runs its own collision, ``CONTACT_F``. MuJoCo Warp supports body observables on
+both CPU and GPU.
 
 :class:`~newton.solvers.SolverSteel` reports only the linear part of each rigid
 contact force; the torque part is zero. Contacts without solved rows, such as rows
