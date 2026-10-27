@@ -7915,9 +7915,9 @@ class TestMuJoCoOptions(unittest.TestCase):
         np.testing.assert_allclose(observables.qfrc_actuator.numpy(), solver.mj_data.qfrc_actuator, atol=1e-6)
 
         solver = SolverMuJoCo(model, use_mujoco_cpu=True, use_mujoco_contacts=False)
-        self.assertNotIn(solver.ObservableKind.CONTACT_F, solver.supported_observables)
-        with self.assertRaisesRegex(ValueError, "does not support"):
-            solver.observables({solver.ObservableKind.CONTACT_F}, contacts=contacts)
+        self.assertIn(solver.ObservableKind.CONTACT_F, solver.supported_observables)
+        observables = solver.observables({solver.ObservableKind.CONTACT_F}, contacts=contacts)
+        self.assertIsNotNone(observables.contact_f)
         with self.assertRaisesRegex(NotImplementedError, "requires use_mujoco_contacts=True"):
             solver.update_contacts(contacts)
 

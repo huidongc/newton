@@ -145,10 +145,13 @@ the velocity impulse divided by ``dt``. MuJoCo computes ``BODY_QDD`` and
 ``BODY_PARENT_F`` even with ``disable_sensors=True`` by enabling the
 post-constraint RNE stage independently of sensors.
 With ``use_mujoco_cpu=True``, body and contact observables are exported
-from the step's input dynamics, including with RK4; use the input state for
-contact positions. Body observables require Euler, RK4, implicit, or implicitfast
-integration. ``CONTACT_F`` and ``QFRC_ACTUATOR`` support any integrator; overflow
-observable requests are rejected.
+from the step's input dynamics; use the input state for contact positions.
+Body observables require Euler, RK4, implicit, or implicitfast integration.
+With ``use_mujoco_contacts=False``, the CPU step solves the Newton contacts
+passed to ``step`` using Euler, implicit, or implicitfast, and ``CONTACT_F``
+stays on those rows. With ``use_mujoco_contacts=True``, MuJoCo runs its own
+collision and ``CONTACT_F`` supports any integrator. Overflow observable
+requests are rejected.
 
 :class:`~newton.solvers.SolverSteel` reports only the linear part of each rigid
 contact force; the torque part is zero. Contacts without solved rows, such as rows

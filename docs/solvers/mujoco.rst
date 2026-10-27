@@ -352,12 +352,13 @@ the mode from user code.
 
 .. note::
 
-   ``use_mujoco_contacts=True`` and the MuJoCo CPU backend do not
-   apply the per-contact two-body factor — MuJoCo's internal
-   ``contact_params`` averages per-geom ``solref``, which cannot
-   reproduce the inverse-mass sum. ``SOLREF_MODE_FORCE_SPACE`` shapes
-   fall back to the legacy ``convert_solref(ke, kd, 1, 1)``
-   approximation on those paths.
+   ``use_mujoco_contacts=True`` does not apply the per-contact
+   two-body factor — MuJoCo's internal ``contact_params`` averages
+   per-geom ``solref``, which cannot reproduce the inverse-mass sum.
+   ``SOLREF_MODE_FORCE_SPACE`` shapes fall back to the legacy
+   ``convert_solref(ke, kd, 1, 1)`` approximation on that path.
+   ``use_mujoco_contacts=False`` applies the factor on both MuJoCo Warp
+   and the native CPU backend.
 
 For parameter interpretation, stability tradeoffs, and task-oriented guidance,
 see :ref:`Tuning MuJoCo`.
